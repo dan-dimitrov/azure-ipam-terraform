@@ -1,0 +1,194 @@
+name: Terraform-Deploy-Production
+
+trigger:
+  branches:
+    exclude:
+      - "*"
+
+variables:
+  - name: appDeploy
+    value: false
+  - name: projectURI
+    value: [ADO_PROJECT_URI]
+  - name: serviceConnection
+    value: [SERVICE_CONNECTION_NAME]
+  - name: skipApply
+    value: false
+  - name: subscriptionId
+    value: [TARGET_SUBSCRIPTION]
+  - name: tfplanfilename
+    value: $(Build.Repository.Name)_$(Build.SourceBranchName).tfplan
+  - name: tfvariables
+    value: " -var 'uiappid=[UID_APP_ID]' -var 'engineappid=[ENGINE_APP_ID]' -var 'engineappsecret=[ENGINE_APP_SECRET]'"
+  - name: validateNotifyUsers
+    value: [VALIDATE_NOTIFICATION_TEAM]
+  - name: workingDirectory
+    value: ""
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+  - stage: Plan
+    displayName: Terraform Plan
+    jobs:
+      - job: plan
+        steps:
+          - checkout: self
+            persistCredentials: true
+          - task: AzureCLI@2
+            displayName: "Az Login"
+            name: azlogin
+            inputs:
+              azureSubscription: ${{ variables.serviceConnection }}
+              addSpnToEnvironment: true
+              scriptType: pscore
+              scriptLocation: inlineScript
+              inlineScript: |
+                # Terraform Environment Variables
+                Write-Host "##vso[task.setvariable variable=ARM_CLIENT_ID;issecret=true]$env:servicePrincipalId"
+                Write-Host "##vso[task.setvariable variable=ARM_CLIENT_SECRET;issecret=true]$env:servicePrincipalKey"
+                Write-Host "##vso[task.setvariable variable=ARM_TENANT_ID;issecret=true]$env:tenantId"
+              workingDirectory: "$(Build.SourcesDirectory)${{ variables.workingDirectory }}"
+          - task: AzureCli@2
+            displayName: "Terraform Initialise"
+            inputs:
+              azureSubscription: ${{ variables.serviceConnection }}
+              scriptType: "pscore"
+              addSpnToEnvironment: true
+              scriptLocation: inlineScript
+              inlineScript: |
+                az login --service-principal --username "$(ARM_CLIENT_ID)" --password "$(ARM_CLIENT_SECRET)" --tenant "$(ARM_TENANT_ID)"
+                $env:ARM_CLIENT_SECRET = "$(ARM_CLIENT_SECRET)"
+                $env:ARM_CLIENT_ID = "$(ARM_CLIENT_ID)"
+                $env:ARM_TENANT_ID = "$(ARM_TENANT_ID)"
+                # Tf uses local git to download modules from git repos.
+                # As AzDO git repos need an access token to auth, we put the pipelines access token into git config. 
+                $accessToken = az account get-access-token --resource '499b84ac-1321-427f-aa17-267ca6975798' --query 'accessToken' --output tsv
+                git config --global http.${{ variables.projectURI }}.extraHeader "AUTHORIZATION: bearer $accessToken"
+                terraform init${{ variables.tfstate }}
+                # On private agents, the git config is not deleted automatically. Therefore deleting the access token manually here.
+                git config --global --unset-all http.${{ variables.projectURI }}.extraHeader
+              workingDirectory: "$(Build.SourcesDirectory)${{ variables.workingDirectory }}"
+            env:
+              ARM_SUBSCRIPTION_ID: ${{ variables.subscriptionId }}
+              AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)
+          - task: AzureCli@2
+            displayName: "Terraform Validate"
+            inputs:
+              azureSubscription: ${{ variables.serviceConnection }}
+              scriptType: "pscore"
+              addSpnToEnvironment: true
+              scriptLocation: inlineScript
+              inlineScript: |
+                terraform validate
+              workingDirectory: "$(Build.SourcesDirectory)${{ variables.workingDirectory }}"
+            env:
+              ARM_SUBSCRIPTION_ID: ${{ variables.subscriptionId }}
+              AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)
+          - task: AzureCli@2
+            displayName: "Terraform Plan"
+            inputs:
+              azureSubscription: ${{ variables.serviceConnection }}
+              scriptType: "pscore"
+              addSpnToEnvironment: true
+              scriptLocation: inlineScript
+              inlineScript: |
+                az login --service-principal --username "$(ARM_CLIENT_ID)" --password "$(ARM_CLIENT_SECRET)" --tenant "$(ARM_TENANT_ID)"
+                $env:ARM_CLIENT_SECRET = "$(ARM_CLIENT_SECRET)"
+                $env:ARM_CLIENT_ID = "$(ARM_CLIENT_ID)"
+                $env:ARM_TENANT_ID = "$(ARM_TENANT_ID)"
+                terraform plan -out='${{ variables.tfplanfilename }}'${{ variables.tfvariables }}
+              workingDirectory: "$(Build.SourcesDirectory)${{ variables.workingDirectory }}"
+            env:
+              ARM_SUBSCRIPTION_ID: ${{ variables.subscriptionId }}
+              AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)
+          - task: PublishBuildArtifacts@1
+            displayName: "Publish Artifact - TFPlan"
+            condition: succeeded()
+            inputs:
+              PathtoPublish: "$(Build.SourcesDirectory)${{ variables.workingDirectory }}/${{ variables.tfplanfilename }}"
+              ArtifactName: "TerraformPlan"
+              publishLocation: "Container"
+  - stage: Validate
+    displayName: Validate Resources
+    condition: and(eq(variables['Build.SourceBranch'], 'refs/heads/main'), succeeded())
+    jobs:
+      - job: validate
+        pool: server
+        steps:
+          - task: ManualValidation@0
+            timeoutInMinutes: 1440 # task times out in 1 day
+            inputs:
+              notifyUsers: ${{ variables.validateNotifyUsers }}
+              instructions: "Please validate the terraform environment and resume for deletion."
+              onTimeout: ${{ variables.timoutEffect }}
+  - stage: Apply
+    displayName: Terraform Apply
+    condition: and(eq(variables['Build.SourceBranch'], 'refs/heads/main'), eq(${{ variables.skipApply }}, false), succeeded())
+    jobs:
+      - job: apply
+        steps:
+          - checkout: self
+            persistCredentials: true
+          - task: AzureCLI@2
+            displayName: "Az Login"
+            name: azlogin
+            inputs:
+              azureSubscription: ${{ variables.serviceConnection }}
+              addSpnToEnvironment: true
+              scriptType: pscore
+              scriptLocation: inlineScript
+              inlineScript: |
+                # Terraform Environment Variables
+                Write-Host "##vso[task.setvariable variable=ARM_CLIENT_ID;issecret=true]$env:servicePrincipalId"
+                Write-Host "##vso[task.setvariable variable=ARM_CLIENT_SECRET;issecret=true]$env:servicePrincipalKey"
+                Write-Host "##vso[task.setvariable variable=ARM_TENANT_ID;issecret=true]$env:tenantId"
+              workingDirectory: "$(Build.SourcesDirectory)${{ variables.workingDirectory }}"
+          - task: AzureCli@2
+            displayName: "Terraform Initialise"
+            inputs:
+              azureSubscription: ${{ variables.serviceConnection }}
+              scriptType: "pscore"
+              addSpnToEnvironment: true
+              scriptLocation: inlineScript
+              inlineScript: |
+                az login --service-principal --username "$(ARM_CLIENT_ID)" --password "$(ARM_CLIENT_SECRET)" --tenant "$(ARM_TENANT_ID)"
+                $env:ARM_CLIENT_SECRET = "$(ARM_CLIENT_SECRET)"
+                $env:ARM_CLIENT_ID = "$(ARM_CLIENT_ID)"
+                $env:ARM_TENANT_ID = "$(ARM_TENANT_ID)"
+                # Tf uses local git to download modules from git repos.
+                # As AzDO git repos need an access token to auth, we put the pipelines access token into git config. 
+                $accessToken = az account get-access-token --resource '499b84ac-1321-427f-aa17-267ca6975798' --query 'accessToken' --output tsv
+                git config --global http.${{ variables.projectURI }}.extraHeader "AUTHORIZATION: bearer $accessToken"
+                terraform init${{ variables.tfstate }}
+                # On private agents, the git config is not deleted automatically. Therefore deleting the access token manually here.
+                git config --global --unset-all http.${{ variables.projectURI }}.extraHeader
+              workingDirectory: "$(Build.SourcesDirectory)${{ variables.workingDirectory }}"
+            env:
+              ARM_SUBSCRIPTION_ID: ${{ variables.subscriptionId }}
+              AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)
+          - task: DownloadBuildArtifacts@1
+            displayName: "Download Artifact - TFPlan"
+            inputs:
+              buildType: "current"
+              downloadType: "single"
+              artifactName: "TerraformPlan"
+              downloadPath: "$(Build.SourcesDirectory)"
+          - task: AzureCli@2
+            displayName: "Terraform Apply"
+            inputs:
+              azureSubscription: ${{ variables.serviceConnection }}
+              scriptType: "pscore"
+              addSpnToEnvironment: true
+              scriptLocation: inlineScript
+              inlineScript: |
+                az login --service-principal --username "$(ARM_CLIENT_ID)" --password "$(ARM_CLIENT_SECRET)" --tenant "$(ARM_TENANT_ID)"
+                $env:ARM_CLIENT_SECRET = "$(ARM_CLIENT_SECRET)"
+                $env:ARM_CLIENT_ID = "$(ARM_CLIENT_ID)"
+                $env:ARM_TENANT_ID = "$(ARM_TENANT_ID)"
+                terraform apply -input=false -auto-approve${{ variables.tfvariables }}
+              workingDirectory: "$(Build.SourcesDirectory)${{ variables.workingDirectory }}"
+            env:
+              ARM_SUBSCRIPTION_ID: ${{ variables.subscriptionId }}
+              AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)
